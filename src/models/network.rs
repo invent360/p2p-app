@@ -1,9 +1,9 @@
 use clap::Parser;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use libp2p::multiaddr::Protocol;
 use libp2p::rendezvous::Cookie;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous};
+use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous, gossipsub};
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
@@ -11,6 +11,13 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
 use futures::future::FutureExt;
+use actix::prelude::*;
+use actix_web_actors::ws;
+use std::{collections::hash_map::DefaultHasher, error::Error as StdError, hash::{Hash, Hasher}, io};
+use awc::Client;
+use awc::ws::{Frame, Message as WsMessage};
+use bytestring::ByteString;
+use crate::errors::{WsError};
 
 pub const NAMESPACE: &str = "rendezvous";
 
@@ -19,6 +26,7 @@ pub struct MyBehaviour {
     pub identify: identify::Behaviour,
     pub rendezvous_server: rendezvous::server::Behaviour,
     pub rendezvous_client: rendezvous::client::Behaviour,
+    pub gossip_sub: gossipsub::Behaviour,
     pub ping: ping::Behaviour,
 }
 
@@ -33,6 +41,9 @@ pub struct Args {
 
     #[clap(long)]
     pub rendezvous_point: Option<PeerId>,
+
+    #[clap(long)]
+    pub websocket_address: Option<String>,
 }
 
 pub async fn discover_peers(
@@ -40,6 +51,7 @@ pub async fn discover_peers(
     rendezvous_point_address: Option<Multiaddr>,
     rendezvous_point: Option<PeerId>,
     discovered_peers_sender: mpsc::Sender<PeerId>,
+    websocket_address: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut swarm = swarm.lock().await;
@@ -58,41 +70,109 @@ pub async fn discover_peers(
             }.boxed().fuse() => match event {
 
                 /*
-                 * Server [ConnectionEstablished]
+                 * Incoming Connection
                  */
-                SwarmEvent::ConnectionEstablished { peer_id, .. }
-                if Some(peer_id) == rendezvous_point => {
-                 /*
-                  * [1]:Discoverer Log
-                  */
+                SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
                     tracing::info!(
-                        "Connecting to rendezvous point {}, & discovering nodes in '{}' namespace ...",
-                        peer_id,
-                        NAMESPACE
+                        "Incoming connection from {} to {}",
+                        send_back_addr,
+                        local_addr
                     );
+                }
 
                 /*
-                 * [2]:Registration at rdv server
+                 * Incoming Connection Error
                  */
-                if let Err(error) = swarm.behaviour_mut().rendezvous_client.register(
-                    rendezvous::Namespace::from_static("rendezvous"),
-                    peer_id,
-                    None,
-                ) {
-                    tracing::error!("Failed to register: {error}");
+                SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, error, .. } => {
+                    tracing::error!(
+                        "Incoming connection error from {} to {}: {}",
+                        send_back_addr,
+                        local_addr,
+                        error
+                    );
                 }
-                tracing::info!("Connection established with rendezvous point {}", peer_id);
 
-                 /*
-                 * [3] Discovery
+                /*
+                 * Connection Closed
                  */
-                if let Some(rdv_peer_id) = rendezvous_point {
-                        swarm.behaviour_mut().rendezvous_client.discover(
-                            Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
-                            None,
-                            None,
-                            rdv_peer_id,
+                SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                    if let Some(error) = cause {
+                        tracing::error!(
+                            "Connection closed with peer {}: {}",
+                            peer_id,
+                            error
                         );
+                    } else {
+                        tracing::info!(
+                            "Connection closed with peer {}",
+                            peer_id
+                        );
+                    }
+                }
+
+                    /*
+                     * Outgoing Connection Error (Dial Failure)
+                     */
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        if let Some(peer_id) = peer_id {
+                            tracing::error!(
+                                "Failed to dial peer {}: {}",
+                                peer_id,
+                                error
+                            );
+                        } else {
+                            tracing::error!(
+                                "Failed to dial peer: {}",
+                                error
+                            );
+                        }
+                    }
+
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    if Some(peer_id) == rendezvous_point.clone() {
+                        /*
+                         * [1]:Discoverer Log
+                         */
+                        tracing::info!(
+                            "Connecting to rendezvous point {}, & discovering nodes in '{}' namespace ...",
+                            peer_id,
+                            NAMESPACE
+                        );
+
+                        /*
+                         * [2]:Registration at rdv server
+                         */
+                        if let Err(error) = swarm.behaviour_mut().rendezvous_client.register(
+                            rendezvous::Namespace::from_static("rendezvous"),
+                            peer_id,
+                            None,
+                        ) {
+                            tracing::error!("Failed to register: {error}");
+                        }
+                        tracing::info!("Connection established with rendezvous point {}", peer_id);
+
+                        /*
+                         * [3] Discovery
+                         */
+                        if let Some(rdv_peer_id) = rendezvous_point {
+                                swarm.behaviour_mut().rendezvous_client.discover(
+                                    Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
+                                    None,
+                                    None,
+                                    rdv_peer_id,
+                                );
+                            }
+
+
+                    } else {
+                        tracing::info!("Publishing message to peer");
+                        let topic = gossipsub::IdentTopic::new(peer_id.to_string());
+                        let message = format!("Hello, peer {}!", peer_id);
+                        if let Err(e) = swarm.behaviour_mut().gossip_sub.publish(topic, message.as_bytes()) {
+                            tracing::error!("Failed to publish message: {}", e);
+                        } else {
+                            tracing::info!("Message published to topic: {}", peer_id);
+                        }
                     }
                 }
 
@@ -157,9 +237,12 @@ pub async fn discover_peers(
                                 address.clone()
                             };
 
+                            tracing::info!("Dialing discovered peer {}", address_with_p2p.clone());
                             if let Err(e) = swarm.dial(address_with_p2p) {
                                 tracing::error!("Failed to dial peer {}: {}", peer, e);
                             } else {
+                                 tracing::info!("Dial successful");
+
                                 if let Err(e) = discovered_peers_sender.send(peer).await {
                                     tracing::error!("Failed to send discovered peer to main thread: {}", e);
                                 }
@@ -204,3 +287,24 @@ pub async fn discover_peers(
     }
 }
 
+
+pub async fn connect_to_websocket(ws_url: String, peer_id: PeerId) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    let client = Client::new(); // Use the awc client
+
+    // Connect to the WebSocket server and map the error to the custom error type
+    let (response, mut framed) = client.ws(&ws_url)
+        .connect()
+        .await
+        .map_err(|e| Box::new(WsError::ClientError(e)) as Box<dyn StdError + Send + Sync>)?;
+
+    tracing::info!("Connected to WebSocket server for peer {}", peer_id);
+
+    // Convert the formatted String to ByteString
+    let message = ByteString::from(format!("Hello from peer {}", peer_id));
+
+    // Send a message to the WebSocket server
+    framed.send(WsMessage::Text(message)).await
+        .map_err(|e| Box::new(WsError::ProtocolError(e)) as Box<dyn StdError + Send + Sync>)?;
+
+    Ok(())
+}
