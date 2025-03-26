@@ -3,11 +3,21 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::rendezvous::Cookie;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous, gossipsub, kad};
+use libp2p::{
+    Multiaddr,
+    PeerId,
+    Swarm,
+    identify,
+    ping,
+    rendezvous,
+    gossipsub,
+    kad::{self, store::MemoryStore},
+    mdns::{self, tokio::Behaviour as MdnsBehaviour},
+};
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use actix::Actor;
 use actix_web::dev::Server;
@@ -17,7 +27,8 @@ use actix_web::middleware::Logger;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
 use futures::future::FutureExt;
-use crate::actors;
+use serde_json::{json, Value};
+use crate::{actors, Metrics, MAX_RETRIES};
 
 pub const NAMESPACE: &str = "rendezvous";
 
@@ -26,7 +37,8 @@ pub struct MyBehaviour {
     pub identify: identify::Behaviour,
     pub rendezvous_server: rendezvous::server::Behaviour,
     pub rendezvous_client: rendezvous::client::Behaviour,
-    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub mdns: MdnsBehaviour,
+    pub kademlia: kad::Behaviour<MemoryStore>,
 }
 
 #[derive(Parser, Debug)]
@@ -50,39 +62,39 @@ pub async fn discover_peers(
     rendezvous_point_address: Option<Multiaddr>,
     rendezvous_point: Option<PeerId>,
     discovered_peers_sender: mpsc::Sender<PeerId>,
+    metrics: Arc<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     let mut swarm = swarm.lock().await;
 
     if let Some(addr) = rendezvous_point_address.clone() {
-        swarm.dial(addr.clone())?;
+        if let Err(e) = swarm.dial(addr.clone()) {
+            metrics.failed_connections.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(address = %addr, error = %e, "Failed to dial rendezvous point");
+            return Err(e.into());
+        }
     }
 
     let mut discover_tick = tokio::time::interval(Duration::from_secs(5));
     let mut cookie = None;
+    let mut retry_count = 0;
 
     loop {
         tokio::select! {
             event = async {
                 swarm.select_next_some().await
             }.boxed().fuse() => match event {
-
-                /*
-                 * Server [ConnectionEstablished]
-                 */
-                   SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-
-                    tracing::info!("ConnectionEstablished: peer {}", peer_id);
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    metrics.successful_connections.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        peer_id = %peer_id,
+                        "Connection established"
+                    );
 
                     if Some(peer_id) == rendezvous_point.clone() {
-
-                        /*
-                         * [1]:Registration at rdv server
-                         */
                         tracing::info!(
-                            "Connecting to rendezvous point {}, & discovering nodes in '{}' namespace ...",
-                            peer_id,
-                            NAMESPACE
+                            rendezvous_point = %peer_id,
+                            namespace = NAMESPACE,
+                            "Connecting to rendezvous point and discovering nodes"
                         );
 
                         if let Err(error) = swarm.behaviour_mut().rendezvous_client.register(
@@ -90,26 +102,35 @@ pub async fn discover_peers(
                             peer_id,
                             None,
                         ) {
-                            tracing::error!("Failed to register: {error}");
+                            metrics.failed_connections.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(
+                                error = %error,
+                                "Failed to register with rendezvous point"
+                            );
+
+                            // Exponential backoff for retry
+                            let delay = Duration::from_secs(5) * (retry_count as u32 + 1);
+                            tokio::time::sleep(delay).await;
+                            retry_count += 1;
+
+                            if retry_count > MAX_RETRIES {
+                                return Err(error.into());
+                            }
+                        } else {
+                            retry_count = 0;
                         }
 
-                        /*
-                         * [2] Discovery
-                         */
                         if let Some(rdv_peer_id) = rendezvous_point {
-                                swarm.behaviour_mut().rendezvous_client.discover(
-                                    Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
-                                    None,
-                                    None,
-                                    rdv_peer_id,
-                                );
-                            }
+                            swarm.behaviour_mut().rendezvous_client.discover(
+                                Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
+                                None,
+                                None,
+                                rdv_peer_id,
+                            );
+                        }
                     }
                 }
 
-                /*
-                 * Client [Discovered]
-                 */
                 SwarmEvent::Behaviour(MyBehaviourEvent::RendezvousClient(
                     rendezvous::client::Event::Discovered {
                         registrations,
@@ -118,74 +139,95 @@ pub async fn discover_peers(
                     }
                 )) => {
                     cookie.replace(new_cookie);
-                    tracing::info!("Discovered {} peers", registrations.len());
+                    metrics.peers_discovered.fetch_add(registrations.len(), Ordering::Relaxed);
+
+                    tracing::info!(
+                        peer_count = registrations.len(),
+                        "Discovered peers via rendezvous"
+                    );
+
+                    // Create structured JSON output for discovered peers
+                    let peers_json: Vec<Value> = registrations.iter().map(|registration| {
+                        json!({
+                            "peer_id": registration.record.peer_id().to_string(),
+                            "addresses": registration.record.addresses().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                            "namespace": registration.namespace.to_string(),
+                            "ttl": registration.ttl.to_string(),
+                        })
+                    }).collect();
+
+                    tracing::info!(
+                        peers = %serde_json::to_string_pretty(&peers_json).unwrap_or_default(),
+                        "Discovered peers details"
+                    );
 
                     for registration in registrations {
                         for address in registration.record.addresses() {
                             let peer = registration.record.peer_id();
-                            tracing::info!(%peer, %address, "Discovered peer");
+
+                            tracing::info!(
+                                peer_id = %peer,
+                                address = %address,
+                                "Discovered peer"
+                            );
 
                             if peer == swarm.local_peer_id().clone() {
-                                tracing::info!(%peer, "Discovered peer is myself, skipping dial");
+                                tracing::info!(
+                                    peer_id = %peer,
+                                    "Discovered peer is myself, skipping dial"
+                                );
                                 continue;
                             }
 
                             if let Some(rdv_peer_id) = rendezvous_point {
                                 if peer == rdv_peer_id {
-                                    tracing::info!(%peer, "Discovered peer is rendezvous point, skipping dial");
+                                    tracing::info!(
+                                        peer_id = %peer,
+                                        "Discovered peer is rendezvous point, skipping dial"
+                                    );
                                     continue;
                                 }
                             }
 
                             if let Err(e) = discovered_peers_sender.send(peer).await {
-                                    tracing::error!("Failed to send discovered peer to main thread: {}", e);
+                                metrics.failed_connections.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to send discovered peer to main thread"
+                                );
                             }
                         }
                     }
                 }
 
-                // Handle other unhandled events
                 other => {
-                    tracing::debug!("Unhandled SwarmEvent: {:?}", other);
+                    tracing::debug!(
+                        event = ?other,
+                        "Unhandled SwarmEvent in discover_peers"
+                    );
                 }
             },
 
-            // Periodic discovery tick
             _ = discover_tick.tick(), if cookie.is_some() => {
                 if let Some(rendezvous_point) = rendezvous_point.clone() {
+                    metrics.discovery_retries.fetch_add(1, Ordering::Relaxed);
                     swarm.behaviour_mut().rendezvous_client.discover(
                         Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
                         cookie.clone(),
                         None,
                         rendezvous_point,
                     );
-                    tracing::info!("Sent periodic discovery request to rendezvous point {}", rendezvous_point);
+                    tracing::info!(
+                        rendezvous_point = %rendezvous_point,
+                        "Sent periodic discovery request"
+                    );
                 }
             }
         }
     }
 }
 
-
 pub async fn connect_to_websocket(ws_url: String, peer_id: PeerId) -> Result<(), Box<dyn std::error::Error>> {
-/*    let client = Client::new(); // Use the awc client
-
-    // Connect to the WebSocket server and map the error to the custom error type
-    let (response, mut framed) = client.ws(&ws_url)
-        .connect()
-        .await
-        .map_err(|e| Box::new(WsError::ClientError(e)) as Box<dyn StdError + Send + Sync>)?;
-
-    tracing::info!("Connected to WebSocket server for peer {}", peer_id);
-
-    // Convert the formatted String to ByteString
-    let message = ByteString::from(format!("Hello from peer {}", peer_id));
-
-    // Send a message to the WebSocket server
-    framed.send(WsMessage::Text(message)).await
-        .map_err(|e| Box::new(WsError::ProtocolError(e)) as Box<dyn StdError + Send + Sync>)?;*/
-
-
     Ok(())
 }
 
@@ -206,9 +248,26 @@ pub async fn start_websocket() -> Result<Server, Box<dyn std::error::Error + Sen
             .app_data(web::Data::new(room_actor.clone()))
             .route("/ws", web::get().to(actors::session_actor::WsChatSession::connect))
             .wrap(Logger::default())
+            // Enhanced error handler for WebSocket connections
+            .app_data(web::JsonConfig::default().error_handler(|err, _req| {
+                actix_web::error::InternalError::from_response(
+                    "",
+                    actix_web::HttpResponse::BadRequest()
+                        .content_type("application/json")
+                        .body(serde_json::to_string(&json!({
+                            "error": "Invalid JSON",
+                            "details": err.to_string()
+                        })).unwrap()),
+                )
+                    .into()
+            }))
     })
         .workers(2)
-        .bind("127.0.0.1:8001")?
+        .bind("127.0.0.1:8001")
+        .map_err(|e| {
+            tracing::error!("Failed to bind WebSocket server: {}", e);
+            e
+        })?
         .run();
 
     Ok(server)
