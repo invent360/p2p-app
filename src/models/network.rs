@@ -3,14 +3,21 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::rendezvous::Cookie;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous};
+use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous, gossipsub, kad};
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
+use actix::Actor;
+use actix_web::dev::Server;
+use actix_web::{web, App, HttpServer};
+use actix_cors::Cors;
+use actix_web::middleware::Logger;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
 use futures::future::FutureExt;
+use crate::actors;
 
 pub const NAMESPACE: &str = "rendezvous";
 
@@ -19,11 +26,11 @@ pub struct MyBehaviour {
     pub identify: identify::Behaviour,
     pub rendezvous_server: rendezvous::server::Behaviour,
     pub rendezvous_client: rendezvous::client::Behaviour,
-    pub ping: ping::Behaviour,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
 #[derive(Parser, Debug)]
-#[clap(name = "libp2p_rendezvous_client")]
+#[clap(name = "p2p_rendezvous_client")]
 pub struct Args {
     #[clap(long)]
     pub external_address: Option<Multiaddr>,
@@ -33,6 +40,9 @@ pub struct Args {
 
     #[clap(long)]
     pub rendezvous_point: Option<PeerId>,
+
+    #[clap(long)]
+    pub bootstrap_peer: Option<PeerId>,
 }
 
 pub async fn discover_peers(
@@ -60,76 +70,41 @@ pub async fn discover_peers(
                 /*
                  * Server [ConnectionEstablished]
                  */
-                SwarmEvent::ConnectionEstablished { peer_id, .. }
-                if Some(peer_id) == rendezvous_point => {
-                 /*
-                  * [1]:Discoverer Log
-                  */
-                    tracing::info!(
-                        "Connecting to rendezvous point {}, & discovering nodes in '{}' namespace ...",
-                        peer_id,
-                        NAMESPACE
-                    );
+                   SwarmEvent::ConnectionEstablished { peer_id, .. } => {
 
-                /*
-                 * [2]:Registration at rdv server
-                 */
-                if let Err(error) = swarm.behaviour_mut().rendezvous_client.register(
-                    rendezvous::Namespace::from_static("rendezvous"),
-                    peer_id,
-                    None,
-                ) {
-                    tracing::error!("Failed to register: {error}");
-                }
-                tracing::info!("Connection established with rendezvous point {}", peer_id);
+                    tracing::info!("ConnectionEstablished: peer {}", peer_id);
 
-                 /*
-                 * [3] Discovery
-                 */
-                if let Some(rdv_peer_id) = rendezvous_point {
-                        swarm.behaviour_mut().rendezvous_client.discover(
-                            Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
-                            None,
-                            None,
-                            rdv_peer_id,
+                    if Some(peer_id) == rendezvous_point.clone() {
+
+                        /*
+                         * [1]:Registration at rdv server
+                         */
+                        tracing::info!(
+                            "Connecting to rendezvous point {}, & discovering nodes in '{}' namespace ...",
+                            peer_id,
+                            NAMESPACE
                         );
+
+                        if let Err(error) = swarm.behaviour_mut().rendezvous_client.register(
+                            rendezvous::Namespace::from_static("rendezvous"),
+                            peer_id,
+                            None,
+                        ) {
+                            tracing::error!("Failed to register: {error}");
+                        }
+
+                        /*
+                         * [2] Discovery
+                         */
+                        if let Some(rdv_peer_id) = rendezvous_point {
+                                swarm.behaviour_mut().rendezvous_client.discover(
+                                    Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
+                                    None,
+                                    None,
+                                    rdv_peer_id,
+                                );
+                            }
                     }
-                }
-
-                /*
-                 * Client [Registered]
-                 */
-                SwarmEvent::Behaviour(MyBehaviourEvent::RendezvousClient(
-                    rendezvous::client::Event::Registered {
-                        namespace,
-                        ttl,
-                        rendezvous_node,
-                    },
-                )) => {
-                    tracing::info!(
-                        "Registered for namespace '{}' at rendezvous point {} for the next {} seconds",
-                        namespace,
-                        rendezvous_node,
-                        ttl
-                    );
-                }
-
-                /*
-                 * Client [RegisterFailed]
-                 */
-                SwarmEvent::Behaviour(MyBehaviourEvent::RendezvousClient(
-                rendezvous::client::Event::RegisterFailed {
-                    rendezvous_node,
-                    namespace,
-                    error,
-                },
-            )) => {
-                tracing::error!(
-                    "Failed to register: rendezvous_node={}, namespace={}, error_code={:?}",
-                    rendezvous_node,
-                    namespace,
-                        error
-                    );
                 }
 
                 /*
@@ -150,34 +125,21 @@ pub async fn discover_peers(
                             let peer = registration.record.peer_id();
                             tracing::info!(%peer, %address, "Discovered peer");
 
-                            let p2p_suffix = Protocol::P2p(peer);
-                            let address_with_p2p = if !address.ends_with(&Multiaddr::empty().with(p2p_suffix.clone())) {
-                                address.clone().with(p2p_suffix)
-                            } else {
-                                address.clone()
-                            };
+                            if peer == swarm.local_peer_id().clone() {
+                                tracing::info!(%peer, "Discovered peer is myself, skipping dial");
+                                continue;
+                            }
 
-                            if let Err(e) = swarm.dial(address_with_p2p) {
-                                tracing::error!("Failed to dial peer {}: {}", peer, e);
-                            } else {
-                                if let Err(e) = discovered_peers_sender.send(peer).await {
-                                    tracing::error!("Failed to send discovered peer to main thread: {}", e);
+                            if let Some(rdv_peer_id) = rendezvous_point {
+                                if peer == rdv_peer_id {
+                                    tracing::info!(%peer, "Discovered peer is rendezvous point, skipping dial");
+                                    continue;
                                 }
                             }
-                        }
-                    }
-                }
 
-                // Handle ping events (optional)
-                SwarmEvent::Behaviour(MyBehaviourEvent::Ping(ping::Event {
-                    peer,
-                    result: Ok(rtt),
-                    ..
-                })) => {
-                    // Only log ping events if the peer is not the rendezvous point
-                    if let Some(rendezvous_peer) = rendezvous_point.clone() {
-                        if peer != rendezvous_peer {
-                            tracing::info!(%peer, "Ping is {}ms", rtt.as_millis());
+                            if let Err(e) = discovered_peers_sender.send(peer).await {
+                                    tracing::error!("Failed to send discovered peer to main thread: {}", e);
+                            }
                         }
                     }
                 }
@@ -204,3 +166,50 @@ pub async fn discover_peers(
     }
 }
 
+
+pub async fn connect_to_websocket(ws_url: String, peer_id: PeerId) -> Result<(), Box<dyn std::error::Error>> {
+/*    let client = Client::new(); // Use the awc client
+
+    // Connect to the WebSocket server and map the error to the custom error type
+    let (response, mut framed) = client.ws(&ws_url)
+        .connect()
+        .await
+        .map_err(|e| Box::new(WsError::ClientError(e)) as Box<dyn StdError + Send + Sync>)?;
+
+    tracing::info!("Connected to WebSocket server for peer {}", peer_id);
+
+    // Convert the formatted String to ByteString
+    let message = ByteString::from(format!("Hello from peer {}", peer_id));
+
+    // Send a message to the WebSocket server
+    framed.send(WsMessage::Text(message)).await
+        .map_err(|e| Box::new(WsError::ProtocolError(e)) as Box<dyn StdError + Send + Sync>)?;*/
+
+
+    Ok(())
+}
+
+pub async fn start_websocket() -> Result<Server, Box<dyn std::error::Error + Send + Sync>> {
+    let app_state = Arc::new(AtomicUsize::new(0));
+    let room_actor = actors::room_actor::RoomActor::new(app_state.clone()).start();
+
+    let server = HttpServer::new(move || {
+        App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .max_age(3600),
+            )
+            .app_data(web::Data::from(app_state.clone()))
+            .app_data(web::Data::new(room_actor.clone()))
+            .route("/ws", web::get().to(actors::session_actor::WsChatSession::connect))
+            .wrap(Logger::default())
+    })
+        .workers(2)
+        .bind("127.0.0.1:8001")?
+        .run();
+
+    Ok(server)
+}
