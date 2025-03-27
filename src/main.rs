@@ -7,7 +7,7 @@ use crate::models::network::{discover_peers, Args, start_websocket, MyBehaviour,
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
-use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous, gossipsub, kad::{self, store::MemoryStore}, mdns::{self, tokio::Behaviour as MdnsBehaviour}, StreamProtocol, tcp, noise, yamux};
+use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous, gossipsub, kad::{self, store::MemoryStore}, mdns::{self, tokio::Behaviour as MdnsBehaviour}, StreamProtocol, tcp, noise, yamux, autonat, relay};
 use std::sync::Arc;
 use std::{io, thread, time::Duration};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -95,29 +95,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 cfg.set_kbucket_pending_timeout(Duration::from_secs(30));
 
                 let store = MemoryStore::new(key.public().to_peer_id());
-                let kad = kad::Behaviour::with_config(key.public().to_peer_id(), store, cfg);
+                let kademlia_behaviour = kad::Behaviour::with_config(key.public().to_peer_id(), store, cfg);
 
-                let mdns = MdnsBehaviour::new(
+                let mdns_behaviour = MdnsBehaviour::new(
                     mdns::Config::default(),
                     key.public().to_peer_id(),
                 )?;
 
+                let message_id_fn = |message: &gossipsub::Message| {
+                    let mut s = DefaultHasher::new();
+                    message.data.hash(&mut s);
+                    gossipsub::MessageId::from(s.finish().to_string())
+                };
+
+                let gossip_sub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
+                    .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
+                    // signing)
+                    .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
+                    .build()
+                    .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
+
+                // build a gossipsub network behaviour
+                let gossip_behaviour = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossip_sub_config,
+                )?;
+
+                // Set up AutoNAT
+                let auto_nat_behaviour = autonat::Behaviour::new(
+                    key.public().to_peer_id(),
+                    autonat::Config {
+                        retry_interval: Duration::from_secs(10),
+                        refresh_interval: Duration::from_secs(30),
+                        boot_delay: Duration::from_secs(5),
+                        throttle_server_period: Duration::from_secs(30),
+                        ..Default::default()
+                    },
+                );
+
+                // Set up Relay
+                let relay_behaviour = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
+
                 Ok(MyBehaviour {
                     identify: identify::Behaviour::new(identify::Config::new(
-                        "rendezvous-example/1.0.0".to_string(),
+                        "/ipfs/1.0.0".to_string(),
                         key.public(),
                     )),
-                    rendezvous_server: rendezvous::server::Behaviour::new(
-                        rendezvous::server::Config::default(),
-                    ),
-                    rendezvous_client: rendezvous::client::Behaviour::new(key.clone()),
-                    kademlia: kad,
-                    mdns,
+                    kademlia: kademlia_behaviour,
+                    mdns: mdns_behaviour,
+                    gossip_sub: gossip_behaviour,
+                    auto_nat: auto_nat_behaviour,
+                    relay: relay_behaviour
                 })
             })?
             .build();
 
-        // Add bootnodes with error handling
+
         for peer in &BOOTNODES {
             match swarm.behaviour_mut().kademlia.add_address(
                 &peer.parse()?,
@@ -134,6 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+
+        // Create a Gossipsub topic
+        let topic = gossipsub::IdentTopic::new("test-net");
+        swarm.behaviour_mut().gossip_sub.subscribe(&topic)?;
+
+        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+
 
         // Listen on the specified address with retry logic
         let mut retries = 0;
@@ -167,62 +208,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Err(e);
             }
         };
+
         let websocket_handle = websocket_server.handle();
+
         let server_task = local_set.spawn_local(websocket_server);
 
-        // Perform other setup tasks
-        if let Some(addr) = args.external_address {
-            swarm.add_external_address(addr.clone());
-            tracing::info!(address = %addr, "Added external address");
-        } else {
-            tracing::warn!("No external address provided.");
-        }
-
-        if let Some(addr) = args.rendezvous_point_address.clone() {
-            match swarm.dial(addr.clone()) {
-                Ok(_) => tracing::info!(address = %addr, "Successfully dialed rendezvous point"),
-                Err(e) => {
-                    tracing::error!(address = %addr, error = %e, "Failed to dial rendezvous point address");
-                    metrics.failed_connections.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else {
-            tracing::warn!("No rendezvous point address provided.");
-        }
-
-        // Wrap the Swarm in an Arc<Mutex> to share it between tasks
         let swarm = Arc::new(Mutex::new(swarm));
 
-        // Create a channel to receive discovered peers
-        let (discovered_peers_sender, mut discovered_peers_receiver) = mpsc::channel(32);
-
-        // Clone the Arc<Mutex<Swarm>> for the discover_peers task
-        let swarm_for_discover_peers = Arc::clone(&swarm);
-        let metrics_for_discover = Arc::clone(&metrics);
-
-        // Spawn the discover_peers task if we have the required arguments
-        let discover_peers_handle = if let (Some(rendezvous_point_address), Some(rendezvous_point)) =
-            (args.rendezvous_point_address.clone(), args.rendezvous_point)
-        {
-            Some(local_set.spawn_local(async move {
-                if let Err(e) = discover_peers(
-                    swarm_for_discover_peers,
-                    Some(rendezvous_point_address),
-                    Some(rendezvous_point),
-                    discovered_peers_sender,
-                    metrics_for_discover,
-                )
-                    .await
-                {
-                    tracing::error!("Error in discover_peers: {}", e);
-                }
-            }))
-        } else {
-            tracing::warn!("Rendezvous point address or rendezvous point is not provided. Skipping discover_peers.");
-            None
-        };
-
         let swarm_for_main = Arc::clone(&swarm);
+
         let metrics_for_swarm = Arc::clone(&metrics);
 
         // Create a future for the swarm event loop
@@ -290,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
 
                     SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        let mut swarm = swarm_for_main.lock().await;
                         for (peer_id, addr) in list {
                             metrics_for_swarm.peers_discovered.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(
@@ -298,20 +293,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 source = "mdns",
                                 "Discovered local peer"
                             );
+                            swarm.behaviour_mut().gossip_sub.add_explicit_peer(&peer_id);
                         }
                     }
+
+
                     SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                        let mut swarm = swarm_for_main.lock().await;
                         for (peer_id, _multiaddr) in list {
                             tracing::info!(
                                 peer_id = %peer_id,
                                 "mDNS discover peer has expired"
                             );
+                            swarm.behaviour_mut().gossip_sub.remove_explicit_peer(&peer_id);
                         }
                     },
 
-                    // Handle successful closest peers query
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(
-                                              kad::Event::OutboundQueryProgressed {
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
                                                   result: kad::QueryResult::GetClosestPeers(Ok(ok)),
                                                   ..
                                               },
@@ -341,7 +339,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                     }
 
-                    // Handle failed closest peers query
                     SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(
                                               kad::Event::OutboundQueryProgressed {
                                                   result: kad::QueryResult::GetClosestPeers(Err(e)),
@@ -362,7 +359,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                             tracing::warn!("Bootstrap failed: {}", e);
                         }
-                    }
+                    },
+
+                    SwarmEvent::Behaviour(MyBehaviourEvent::GossipSub(gossipsub::Event::Message {
+                                                                          propagation_source: peer_id,
+                                                                          message_id: id,
+                                                                          message,
+                                                                      })) => println!(
+                        "Got message: '{}' with id: {id} from peer: {peer_id}",
+                        String::from_utf8_lossy(&message.data),
+                    ),
 
                     // Other event handlers...
                     other => {
@@ -372,18 +378,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        // Receive discovered peers in the main thread
-        let peers_metrics = Arc::clone(&metrics);
-        let peers_task = local_set.spawn_local(async move {
-            while let Some(peer) = discovered_peers_receiver.recv().await {
-                peers_metrics.peers_discovered.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    peer_id = %peer,
-                    "Dialing discovered peer @ main"
-                );
-            }
-            tracing::warn!("Discovered peers channel closed");
-        });
 
         // Periodic metrics logging
         let metrics_task = local_set.spawn_local({
@@ -412,9 +406,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             _ = server_task => {
                 tracing::info!("WebSocket server task completed");
-            }
-            _ = peers_task => {
-                tracing::warn!("Discovered peers handler exited");
             }
             _ = metrics_task => {
                 tracing::warn!("Metrics task exited");
