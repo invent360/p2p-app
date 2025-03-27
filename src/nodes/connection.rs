@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 #[derive(Debug)]
 pub enum ConnectionEvent {
     Established(PeerId, ConnectionId),
-    Closed(PeerId),
+    Closed(PeerId, ConnectionId),
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +43,16 @@ impl ConnectionManager {
                 connections.remove(peer_id);
             }
         }
+    }
+
+    pub async fn get_peer_for_connection(&self, conn_id: ConnectionId) -> Option<PeerId> {
+        let connections = self.connections.read().await;
+        for (peer_id, conn_ids) in connections.iter() {
+            if conn_ids.contains(&conn_id) {
+                return Some(*peer_id);
+            }
+        }
+        None
     }
 
     pub async fn has_connection(&self, peer_id: &PeerId) -> bool {
