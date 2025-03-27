@@ -3,7 +3,17 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::rendezvous::Cookie;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, identify, ping, rendezvous, gossipsub, kad::{self, store::MemoryStore}, mdns::{self, tokio::Behaviour as MdnsBehaviour}, autonat, relay};
+use libp2p::{
+    Multiaddr,
+    PeerId,
+    Swarm,
+    identify,
+    ping,
+    rendezvous,
+    gossipsub,
+    kad::{self, store::MemoryStore},
+    mdns::{self, tokio::Behaviour as MdnsBehaviour},
+};
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
@@ -25,11 +35,13 @@ pub const NAMESPACE: &str = "rendezvous";
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
     pub identify: identify::Behaviour,
+    pub rendezvous_server: rendezvous::server::Behaviour,
+    pub rendezvous_client: rendezvous::client::Behaviour,
     pub mdns: MdnsBehaviour,
     pub kademlia: kad::Behaviour<MemoryStore>,
-    pub auto_nat: autonat::Behaviour,
-    pub relay: relay::Behaviour,
-    pub gossip_sub: gossipsub::Behaviour,
+    //pub auto_nat: autonat::Behaviour,
+    //pub relay: relay::Behaviour,
+    //pub gossip_sub: gossipsub::Behaviour,
 }
 
 #[derive(Parser, Debug)]
@@ -66,8 +78,8 @@ pub async fn discover_peers(
     }
 
     let mut discover_tick = tokio::time::interval(Duration::from_secs(5));
-    //let mut cookie = None;
-    //let mut retry_count = 0;
+    let mut cookie = None;
+    let mut retry_count = 0;
 
     loop {
         tokio::select! {
@@ -87,9 +99,109 @@ pub async fn discover_peers(
                             namespace = NAMESPACE,
                             "Connecting to rendezvous point and discovering nodes"
                         );
+
+                        if let Err(error) = swarm.behaviour_mut().rendezvous_client.register(
+                            rendezvous::Namespace::from_static("rendezvous"),
+                            peer_id,
+                            None,
+                        ) {
+                            metrics.failed_connections.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(
+                                error = %error,
+                                "Failed to register with rendezvous point"
+                            );
+
+                            // Exponential backoff for retry
+                            let delay = Duration::from_secs(5) * (retry_count as u32 + 1);
+                            tokio::time::sleep(delay).await;
+                            retry_count += 1;
+
+                            if retry_count > MAX_RETRIES {
+                                return Err(error.into());
+                            }
+                        } else {
+                            retry_count = 0;
+                        }
+
+                        if let Some(rdv_peer_id) = rendezvous_point {
+                            swarm.behaviour_mut().rendezvous_client.discover(
+                                Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
+                                None,
+                                None,
+                                rdv_peer_id,
+                            );
+                        }
                     }
                 }
 
+                SwarmEvent::Behaviour(MyBehaviourEvent::RendezvousClient(
+                    rendezvous::client::Event::Discovered {
+                        registrations,
+                        cookie: new_cookie,
+                        ..
+                    }
+                )) => {
+                    cookie.replace(new_cookie);
+                    metrics.peers_discovered.fetch_add(registrations.len(), Ordering::Relaxed);
+
+                    tracing::info!(
+                        peer_count = registrations.len(),
+                        "Discovered peers via rendezvous"
+                    );
+
+                    // Create structured JSON output for discovered peers
+                    let peers_json: Vec<Value> = registrations.iter().map(|registration| {
+                        json!({
+                            "peer_id": registration.record.peer_id().to_string(),
+                            "addresses": registration.record.addresses().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                            "namespace": registration.namespace.to_string(),
+                            "ttl": registration.ttl.to_string(),
+                        })
+                    }).collect();
+
+                    tracing::info!(
+                        peers = %serde_json::to_string_pretty(&peers_json).unwrap_or_default(),
+                        "Discovered peers details"
+                    );
+
+                    for registration in registrations {
+                        for address in registration.record.addresses() {
+                            let peer = registration.record.peer_id();
+
+                            tracing::info!(
+                                peer_id = %peer,
+                                address = %address,
+                                "Discovered peer"
+                            );
+
+                            if peer == swarm.local_peer_id().clone() {
+                                tracing::info!(
+                                    peer_id = %peer,
+                                    "Discovered peer is myself, skipping dial"
+                                );
+                                continue;
+                            }
+
+                            if let Some(rdv_peer_id) = rendezvous_point {
+                                if peer == rdv_peer_id {
+                                    tracing::info!(
+                                        peer_id = %peer,
+                                        "Discovered peer is rendezvous point, skipping dial"
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            if let Err(e) = discovered_peers_sender.send(peer).await {
+                                metrics.failed_connections.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to send discovered peer to main thread"
+                                );
+                            }
+                        }
+                    }
+                }
 
                 other => {
                     tracing::debug!(
@@ -99,15 +211,21 @@ pub async fn discover_peers(
                 }
             },
 
-/*            _ = discover_tick.tick(), if cookie.is_some() => {
+            _ = discover_tick.tick(), if cookie.is_some() => {
                 if let Some(rendezvous_point) = rendezvous_point.clone() {
                     metrics.discovery_retries.fetch_add(1, Ordering::Relaxed);
+                    swarm.behaviour_mut().rendezvous_client.discover(
+                        Some(rendezvous::Namespace::new(NAMESPACE.to_string()).unwrap()),
+                        cookie.clone(),
+                        None,
+                        rendezvous_point,
+                    );
                     tracing::info!(
                         rendezvous_point = %rendezvous_point,
                         "Sent periodic discovery request"
                     );
                 }
-            }*/
+            }
         }
     }
 }
@@ -148,7 +266,7 @@ pub async fn start_websocket() -> Result<Server, Box<dyn std::error::Error + Sen
             }))
     })
         .workers(2)
-        .bind("127.0.0.1:8007")
+        .bind("127.0.0.1:8001")
         .map_err(|e| {
             tracing::error!("Failed to bind WebSocket server: {}", e);
             e
